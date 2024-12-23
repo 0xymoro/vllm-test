@@ -188,6 +188,7 @@ class OpenAIServingChat(OpenAIServing):
                         default_max_tokens)
                 else:
                     sampling_params = request.to_sampling_params(
+                        tokenizer,
                         default_max_tokens)
 
                 self._log_inputs(request_id,
