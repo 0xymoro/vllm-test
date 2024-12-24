@@ -445,80 +445,119 @@ def _apply_dry(
     ranges: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Apply Don't Repeat Yourself (DRY) sampling to the logits.
-    Reference: https://github.com/PygmalionAI/aphrodite-engine/blob/a3c03db7355b33c0dfd670b084e827d0aa7442d1/aphrodite/modeling/layers/sampler.py#L621-L702
+    DRY sampler with:
+      - max_ngram = 12
+      - max_occurrences = 8
+      - early_exit_match_len = 8
+    It expects an allowed_length of ~3, passed via allowed_lengths.
+
+    DRY range is given by ranges[irow].item() – if set to 1500 (or 1000, 800, etc.),
+    we only scan that many tokens from the end of the conversation for repetition.
+
+    These parameters aim to catch most chat-based looping
+    while minimizing CPU overhead.
     """
 
     VOCAB_SIZE = logits.size(-1)
-    MAX_NGRAM = 100
 
-    # Process each sequence that has a nonzero multiplier
+    # ---- Key constants for DRY behavior ----
+    MAX_NGRAM = 12             # Maximum length of match to check
+    MAX_OCCURRENCES = 8        # How many occurrences of last_token we analyze
+    EARLY_EXIT_MATCH_LEN = 8   # If we find this large a match, we stop searching
+    # ----------------------------------------
+
     applies_to = multipliers.nonzero(as_tuple=True)[0]
     for irow in applies_to.tolist():
-        # DRY applies to input AND output tokens, so concat w/o padding tokens
-        prompt_len = (len(input_token_ids[irow]) -
-                      (input_token_ids[irow] == VOCAB_SIZE).sum().item())
-        ouput_len = (len(output_token_ids[irow]) -
-                     (output_token_ids[irow] == VOCAB_SIZE).sum().item())
-        token_seq = torch.cat((input_token_ids[irow][:prompt_len],
-                               output_token_ids[irow][:ouput_len]),
-                              dim=0)
+        # 1) Concat input + output tokens (excluding padding == VOCAB_SIZE).
+        prompt_len = len(input_token_ids[irow]) - (input_token_ids[irow] == VOCAB_SIZE).sum().item()
+        output_len = len(output_token_ids[irow]) - (output_token_ids[irow] == VOCAB_SIZE).sum().item()
 
-        range_limit = ranges[irow].item()
-        if range_limit:
+        token_seq = torch.cat(
+            (input_token_ids[irow][:prompt_len],
+             output_token_ids[irow][:output_len]),
+            dim=0
+        )
+
+        # 2) Limit the sequence to the specified DRY range (if any)
+        range_limit = ranges[irow].item()  # e.g., 1500, 1000, 800, etc.
+        if range_limit > 0:
             token_seq = token_seq[-range_limit:]
 
-        last_token = token_seq[-1].item()
-        if last_token in sequence_breakers_ids[irow]:
-            continue  # early out for everything up to the min_ngram check?
+        # If there's no real history to check, skip
+        if token_seq.size(0) < 2:
+            continue
 
-        # Build a mask of all the breaking tokens in the context
-        break_mask = torch.zeros(len(token_seq),
-                                 dtype=torch.bool,
-                                 device=logits.device)
+        last_token = token_seq[-1].item()
+        # If the last token is a break token, skip
+        if last_token in sequence_breakers_ids[irow]:
+            continue
+
+        # 3) Build a break mask so we never match across "sequence breaker" tokens
+        break_mask = torch.zeros(len(token_seq), dtype=torch.bool, device=logits.device)
         for break_tok in sequence_breakers_ids[irow]:
             break_mask.logical_or_(token_seq == break_tok)
 
-        # Find the most recent breaking token (sets ngram limit)
+        # 4) Figure out how large an n-gram can extend back
+        #    until we hit a break or the start of the sequence.
         max_ngram = 0
         for max_ngram in range(min(len(break_mask), MAX_NGRAM + 1)):
             if break_mask[-max_ngram - 1]:
                 break
 
-        min_ngram = allowed_lengths[irow].item()
-        if max_ngram <= min_ngram:  # Too close to a break to match anything
+        min_ngram = allowed_lengths[irow].item()  # typically ~3
+        if max_ngram <= min_ngram:
+            # Too close to a break for penalizing
             continue
 
-        # If [token] is picked, what's the longest ngram that would match?
-        ngram_lens = torch.zeros(VOCAB_SIZE,
-                                 dtype=torch.int32,
-                                 device=logits.device)
+        # We'll store how big the largest match is for each possible next-token
+        ngram_lens = torch.zeros(VOCAB_SIZE, dtype=torch.int32, device=logits.device)
 
-        # Find all instances of the last token- potential ngrams!
-        endpoint_indexes = torch.nonzero(token_seq == last_token,
-                                         as_tuple=True)[0].tolist()
-        # NOTE(alpin): This seems like the slow part.
-        for idx in endpoint_indexes[:-1]:  # Skip the last_token match
-            unwind = 0
-            # Check up to max_ngram tokens prior to idx (we know idx matches)
+        # 5) Identify all positions where `last_token` appears, except the final one
+        endpoint_indexes_all = torch.nonzero(token_seq == last_token, as_tuple=True)[0].tolist()
+        if len(endpoint_indexes_all) < 2:
+            continue
+        endpoint_indexes = endpoint_indexes_all[:-1]
+
+        # 6) Limit how many old occurrences we check (to reduce CPU cost)
+        if len(endpoint_indexes) > MAX_OCCURRENCES:
+            endpoint_indexes = endpoint_indexes[-MAX_OCCURRENCES:]
+
+        # 7) Traverse from newest to oldest occurrence
+        for idx in reversed(endpoint_indexes):
+            # Make sure it's not the actual last token
+            if idx == len(token_seq) - 1:
+                continue
+
+            match_len = 0
+            # Walk backwards, comparing tokens
             for unwind in range(1, min(idx, max_ngram) + 1):
                 if break_mask[idx - unwind]:
+                    # Hit a break token
                     break
                 if token_seq[idx - unwind] != token_seq[-unwind - 1]:
+                    # Mismatch => stop
                     break
-            next_tok = token_seq[idx + 1]
-            # The repeated tokens BEFORE next_tok (+1 to include [idx]).
-            ngram_lens[next_tok] = max(ngram_lens[next_tok].item(), unwind + 1)
+                match_len = unwind
 
-        # Convert ngram lengths to penalty exponents
+            if match_len > 0:
+                # Next token after that occurrence
+                next_tok = token_seq[idx + 1]
+                new_len = match_len + 1  # +1 to include the matched token itself
+
+                # Record the largest match length found for this next token
+                ngram_lens[next_tok] = max(ngram_lens[next_tok].item(), new_len)
+
+                # If we already found an 8-token match, skip further older occurrences
+                if new_len >= EARLY_EXIT_MATCH_LEN:
+                    break
+
+        # 8) Apply the DRY penalty where needed
         penalty_mask = ngram_lens > 0
-        scales = bases[irow]**(ngram_lens[penalty_mask] - min_ngram)
-
-        # Calculate and apply penalties
-        logits[irow][penalty_mask] -= multipliers[irow] * scales
+        if penalty_mask.any():
+            scales = bases[irow] ** (ngram_lens[penalty_mask] - min_ngram)
+            logits[irow][penalty_mask] -= multipliers[irow] * scales
 
     return logits
-
 
 def _apply_top_k_top_p(
     logits: torch.Tensor,
